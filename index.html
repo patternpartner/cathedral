@@ -1,12 +1,447 @@
 <!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Moltbot Admin</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/client/main.tsx"></script>
-  </body>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Cellular Automaton — Local Rule Ecology</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#05070c;touch-action:none}
+canvas{position:fixed;inset:0}
+#hud{position:fixed;top:8px;left:8px;color:#9ab;font:10px monospace;line-height:1.55;pointer-events:none;text-shadow:0 0 4px #000;max-width:360px;z-index:5}
+#hud b{color:#fff}
+#hud .bridge{color:#ff8ecf}
+#gio{position:fixed;bottom:8px;right:8px;z-index:10;display:flex;gap:6px}
+#gio button{background:rgba(30,40,50,0.7);color:#8af;border:1px solid rgba(100,140,180,0.3);font:10px monospace;padding:4px 8px;border-radius:3px;cursor:pointer}
+#gio input{display:none}
+</style>
+</head>
+<body>
+<div id="hud">booting…</div>
+<div id="gio"><button id="gexp">💾 save</button><button id="gimp">📂 load</button><input type="file" id="gfile" accept=".json"></div>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+const c=document.getElementById('c'), X=c.getContext('2d'), hud=document.getElementById('hud');
+let W=0, H=0;
+function resize(){
+  W=c.width=innerWidth; H=c.height=innerHeight;
+  layoutPlots();
+}
+addEventListener('resize', resize);
+
+const WIDTH=48;
+const STEPS=36;
+const POP_SIZE=36;
+const GROWTH_CYCLE=120;
+
+function applyRule(rule, left, mid, right){
+  const idx=(left<<2)|(mid<<1)|right;
+  return (rule>>idx)&1;
+}
+
+function develop(rule, seed){
+  if(!Array.isArray(seed) || seed.length!==WIDTH){
+    seed=new Array(WIDTH).fill(0);
+    seed[(Math.random()*WIDTH)|0]=1;
+  }
+  let row=seed.slice();
+  const history=[row.slice()];
+  let activity=0, transitions=0, lastDensity=row.reduce((a,b)=>a+b,0)/WIDTH;
+  for(let t=0;t<STEPS;t++){
+    const next=new Array(WIDTH);
+    for(let i=0;i<WIDTH;i++){
+      const L=row[(i-1+WIDTH)%WIDTH], M=row[i], R=row[(i+1)%WIDTH];
+      next[i]=applyRule(rule, L, M, R);
+      if(next[i]!==row[i]) transitions++;
+    }
+    row=next;
+    history.push(row.slice());
+    const dens=row.reduce((a,b)=>a+b,0)/WIDTH;
+    activity+=Math.abs(dens-lastDensity);
+    lastDensity=dens;
+  }
+  const finalDens=lastDensity;
+  const extremePenalty=Math.min(finalDens,1-finalDens)<0.04 ? 0.15 : 1;
+  const score=(transitions/(STEPS*WIDTH) + activity*0.6) * extremePenalty;
+  return {history, score, finalDens};
+}
+
+function randomSeed(){
+  const s=new Array(WIDTH);
+  for(let i=0;i<WIDTH;i++) s[i]=Math.random()<0.18?1:0;
+  if(s.every(v=>v===0)) s[(Math.random()*WIDTH)|0]=1;
+  return s;
+}
+
+function freshGenome(bridgeInfluence){
+  return {
+    rule: (Math.random()*256)|0,
+    seed: randomSeed(),
+    bridgeInfluence: bridgeInfluence||0
+  };
+}
+
+function currentInfluence(ind){
+  const dt=tick - (ind.createdTick||0);
+  return (ind.bridgeInfluence||0) * Math.pow(0.5, dt/4000);
+}
+
+function mutateGenome(src){
+  const g={
+    rule: src.rule,
+    seed: (src.seed && src.seed.slice) ? src.seed.slice() : randomSeed(),
+    bridgeInfluence: currentInfluence(src)*0.82
+  };
+  if(Math.random()<0.55){
+    const bit=(Math.random()*8)|0;
+    g.rule ^= (1<<bit);
+  }
+  if(Math.random()<0.45){
+    const n=1+((Math.random()*3)|0);
+    for(let k=0;k<n;k++){
+      const i=(Math.random()*WIDTH)|0;
+      g.seed[i] ^= 1;
+    }
+  }
+  if(Math.random()<0.12){
+    g.rule = (g.rule + ((Math.random()*32)|0) - 16) & 255;
+  }
+  return g;
+}
+
+let population=[];
+let tick=0;
+let plots=[];
+let reproductions=0, bridgeSeeded=0, bridgeReproductions=0;
+
+function layoutPlots(){
+  plots=[];
+  if(W<10||H<10) return;
+  const cols=6, rows=Math.ceil(POP_SIZE/cols);
+  const pw=W/cols, ph=H/rows;
+  for(let i=0;i<POP_SIZE;i++){
+    const gx=i%cols, gy=(i/cols)|0;
+    plots.push({x:gx*pw, y:gy*ph, w:pw, h:ph});
+  }
+}
+
+function developInd(ind){
+  try{
+    const res=develop(ind.rule|0, ind.seed);
+    ind.history=res.history;
+    ind.score=res.score;
+    ind.finalDens=res.finalDens;
+  }catch(e){
+    ind.history=[];
+    ind.score=0;
+    ind.finalDens=0;
+  }
+}
+
+function seedPopulation(){
+  population=[];
+  for(let i=0;i<POP_SIZE;i++){
+    const g=freshGenome(0);
+    const ind={
+      rule: g.rule,
+      seed: g.seed,
+      bridgeInfluence: 0,
+      plotIdx: i,
+      createdTick: 0,
+      reproducedCount: 0,
+      history: [],
+      score: 0,
+      finalDens: 0
+    };
+    population.push(ind);
+    developInd(ind);
+  }
+  layoutPlots();
+}
+
+function growthCycle(){
+  if(population.length===0) return;
+  let worstIdx=-1, worstScore=Infinity, bestIdx=-1, bestScore=-1;
+  for(let k=0;k<7;k++){
+    const idx=(Math.random()*population.length)|0;
+    const s=population[idx].score||0;
+    if(s<worstScore){worstScore=s; worstIdx=idx;}
+    if(s>bestScore){bestScore=s; bestIdx=idx;}
+  }
+  if(worstIdx<0||bestIdx<0||worstIdx===bestIdx) return;
+  const parent=population[bestIdx];
+  const childGenome=mutateGenome(parent);
+  const child={
+    rule: childGenome.rule,
+    seed: childGenome.seed,
+    bridgeInfluence: childGenome.bridgeInfluence,
+    plotIdx: worstIdx,
+    createdTick: tick,
+    reproducedCount: 0,
+    history: [],
+    score: 0,
+    finalDens: 0
+  };
+  population[worstIdx]=child;
+  developInd(child);
+  reproductions++;
+  parent.reproducedCount=(parent.reproducedCount|0)+1;
+  if(currentInfluence(child)>0.5){
+    bridgeReproductions++;
+    networkSend('applied',{kind:'ca'});
+  }
+}
+
+// Rosetta interlingua
+const GES={DRAW:0,TURN:1,BRANCH:2,MERGE:3,REPEAT:4};
+const CORE_OP_GESTURE=[GES.DRAW,GES.TURN,GES.REPEAT,GES.BRANCH,GES.MERGE];
+function clampP(x){x=+x; if(!isFinite(x)) return 0; return x<-1?-1:x>1?1:x;}
+function peOpToGesture(op){op=Math.abs(op|0); return CORE_OP_GESTURE[op%5];}
+function peNativeToGestures(pkt){
+  const out=[], push=(op,p)=>out.push([peOpToGesture(op),clampP(p)]);
+  const d=pkt.data;
+  if((pkt.type==='motif'||pkt.type==='plasmid')&&Array.isArray(d)){
+    for(const ins of d) if(Array.isArray(ins)) push(ins[0],ins[3]);
+  } else if(pkt.type==='migrant'&&d){
+    if(Array.isArray(d.plasmid)) for(const ins of d.plasmid) if(Array.isArray(ins)) push(ins[0],ins[3]);
+    if(Array.isArray(d.tend)) for(const t of d.tend) out.push([GES.DRAW,clampP(t)]);
+  } else if(pkt.type==='inscription'&&d){
+    push(d.op,(d.A||0)-(d.B||0));
+  }
+  return out;
+}
+function gesturesToPeMotif(gestures){
+  const inv={}; inv[GES.DRAW]=0; inv[GES.TURN]=1; inv[GES.BRANCH]=3; inv[GES.MERGE]=4; inv[GES.REPEAT]=2;
+  const m=[];
+  for(const gp of gestures){
+    const op=inv[gp[0]]!==undefined?inv[gp[0]]:0;
+    m.push([op,(Math.random()*8)|0,(Math.random()*8)|0,clampP(gp[1])]);
+  }
+  return m.length?m:[[0,0,0,0]];
+}
+function caToGestures(rule, seed){
+  const out=[];
+  for(let b=0;b<8;b++) out.push([(rule>>b)&1 ? GES.DRAW : GES.MERGE, (b/7)*2-1]);
+  if(Array.isArray(seed)){
+    for(let i=0;i<Math.min(12,seed.length);i++) if(seed[i]) out.push([GES.BRANCH, (i/WIDTH)*2-1]);
+  }
+  if(!out.length) out.push([GES.DRAW,0]);
+  return out;
+}
+function gesturesToCA(gestures){
+  let rule=0;
+  const seed=new Array(WIDTH).fill(0);
+  for(const gp of gestures){
+    const g=gp[0], p=gp[1];
+    if(g===GES.DRAW||g===GES.REPEAT) rule |= (1 << ((((p+1)*3.9)|0)%8));
+    else if(g===GES.MERGE) rule &= \~(1 << ((((p+1)*3.9)|0)%8));
+    else if(g===GES.BRANCH||g===GES.TURN){
+      const i=(((p+1)/2)*WIDTH)|0;
+      if(i>=0&&i<WIDTH) seed[i]=1;
+    }
+  }
+  if(seed.every(v=>v===0)) seed[(Math.random()*WIDTH)|0]=1;
+  return {rule: rule&255, seed};
+}
+
+// Bridge
+let bc=null;
+const uniqueNodeId='ca-'+Math.random().toString(36).slice(2,7);
+const bridgeJobQueue=[];
+let totalSignalsReceived=0, ackApplied=0, lastSignalType='Awaiting Bridge...';
+
+function networkSend(type, data){
+  if(!bc) return;
+  try{ bc.postMessage({v:1, tab:uniqueNodeId, type, data}); }catch(e){}
+}
+function speakStructure(ind){
+  const g=caToGestures(ind.rule, ind.seed);
+  if(!g.length) return;
+  networkSend('lingua', {origin:'ca', gestures:g});
+  networkSend('motif', gesturesToPeMotif(g));
+}
+try{
+  bc=new BroadcastChannel('selection-pe-network');
+  bc.onmessage=function(ev){
+    const m=ev.data;
+    if(!m||!m.type||m.tab===uniqueNodeId) return;
+    totalSignalsReceived++;
+    lastSignalType=m.type;
+    if(m.type==='applied'){ ackApplied++; return; }
+    let gestures=null;
+    if(m.type==='lingua' && Array.isArray(m.gestures)) gestures=m.gestures;
+    else if(m.type==='motif'||m.type==='plasmid'||m.type==='migrant'||m.type==='inscription') gestures=peNativeToGestures(m);
+    if(gestures && gestures.length) bridgeJobQueue.push(gestures);
+  };
+}catch(e){ lastSignalType='Bus Isolation Error'; }
+
+function drainBridgeQueue(){
+  while(bridgeJobQueue.length){
+    const gestures=bridgeJobQueue.shift();
+    const converted=gesturesToCA(gestures);
+    const idx=(Math.random()*population.length)|0;
+    const child={
+      rule: converted.rule,
+      seed: converted.seed,
+      bridgeInfluence: 1,
+      plotIdx: idx,
+      createdTick: tick,
+      reproducedCount: 0,
+      history: [],
+      score: 0,
+      finalDens: 0
+    };
+    population[idx]=child;
+    developInd(child);
+    bridgeSeeded++;
+  }
+}
+
+// Persistence
+const SAVE_KEY='ca_ecology_genome';
+function encodeCA(){
+  const payload={
+    tick,
+    pop: population.map(ind=>({
+      r: ind.rule,
+      s: ind.seed,
+      c: ind.createdTick|0,
+      rc: ind.reproducedCount|0,
+      bi: +(ind.bridgeInfluence||0).toFixed(4)
+    })),
+    stats: {reproductions, bridgeSeeded, bridgeReproductions, totalSignalsReceived, ackApplied}
+  };
+  return btoa(JSON.stringify(payload));
+}
+function decodeCA(b64){
+  try{
+    const payload=JSON.parse(atob(b64));
+    if(!Array.isArray(payload.pop)||!payload.pop.length) return false;
+    population=payload.pop.map((m,i)=>({
+      rule: (m.r|0)&255,
+      seed: Array.isArray(m.s) ? m.s : randomSeed(),
+      plotIdx: i,
+      createdTick: m.c|0,
+      reproducedCount: m.rc|0,
+      bridgeInfluence: m.bi!==undefined ? +m.bi : 0,
+      history: [],
+      score: 0,
+      finalDens: 0
+    }));
+    while(population.length<POP_SIZE){
+      const g=freshGenome(0);
+      population.push({
+        rule: g.rule, seed: g.seed, bridgeInfluence:0,
+        plotIdx: population.length, createdTick:0, reproducedCount:0,
+        history:[], score:0, finalDens:0
+      });
+    }
+    layoutPlots();
+    for(const ind of population) developInd(ind);
+    tick=payload.tick|0;
+    if(payload.stats){
+      reproductions=payload.stats.reproductions|0;
+      bridgeSeeded=payload.stats.bridgeSeeded|0;
+      bridgeReproductions=payload.stats.bridgeReproductions|0;
+      totalSignalsReceived=payload.stats.totalSignalsReceived|0;
+      ackApplied=payload.stats.ackApplied|0;
+    }
+    return true;
+  }catch(e){ return false; }
+}
+function saveToLocalStorage(){ try{ localStorage.setItem(SAVE_KEY, encodeCA()); }catch(e){} }
+function loadFromLocalStorage(){ try{ const s=localStorage.getItem(SAVE_KEY); if(s) return decodeCA(s); }catch(e){} return false; }
+
+document.getElementById('gexp').onclick=function(){
+  const wrapper={type:'ca-ecology-genome', version:1, exportedAt:new Date().toISOString(), genome:encodeCA()};
+  const blob=new Blob([JSON.stringify(wrapper,null,1)], {type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='ca_ecology_t'+tick+'.json';
+  a.click();
+};
+document.getElementById('gimp').onclick=function(){ document.getElementById('gfile').click(); };
+document.getElementById('gfile').onchange=function(ev){
+  const f=ev.target.files[0]; if(!f) return;
+  const reader=new FileReader();
+  reader.onload=function(){
+    try{
+      const wrapper=JSON.parse(reader.result);
+      decodeCA(wrapper.genome||wrapper);
+    }catch(e){}
+  };
+  reader.readAsText(f);
+};
+
+function draw(){
+  if(!X || W<1) return;
+  X.fillStyle='rgba(5,7,12,0.55)';
+  X.fillRect(0,0,W,H);
+  for(let i=0;i<population.length;i++){
+    const ind=population[i];
+    const plot=plots[ind.plotIdx];
+    if(!plot || !ind.history || !ind.history.length) continue;
+    const cellW=plot.w/WIDTH, cellH=plot.h/(STEPS+1);
+    const inf=currentInfluence(ind);
+    for(let t=0;t<ind.history.length;t++){
+      const row=ind.history[t];
+      if(!row) continue;
+      for(let x=0;x<WIDTH;x++){
+        if(!row[x]) continue;
+        const heat=0.35+0.65*(t/STEPS);
+        const r=Math.round((40+heat*80)*(1-inf)+220*inf);
+        const g=Math.round((90+heat*100)*(1-inf)+120*inf);
+        const b=Math.round((160+heat*60)*(1-inf)+180*inf);
+        X.fillStyle=`rgba(\( {r}, \){g},\( {b}, \){0.55+heat*0.35})`;
+        X.fillRect(plot.x+x*cellW, plot.y+t*cellH, Math.ceil(cellW), Math.ceil(cellH));
+      }
+    }
+  }
+  const best=population.reduce((b,ind)=>(ind.score||0)>(b?b.score:-1)?ind:b, null);
+  const meanInfluence=population.length ? population.reduce((s,ind)=>s+currentInfluence(ind),0)/population.length : 0;
+  hud.innerHTML=
+    '<b>Cellular Automaton</b> — local rule ecology<br>'+
+    'tick <b>'+tick+'</b> &nbsp; pop <b>'+population.length+'</b> &nbsp; '+WIDTH+'×'+STEPS+'<br>'+
+    'growth cycles: <b>'+reproductions+'</b><br>'+
+    '<hr style="border:0;border-top:1px solid #223;margin:4px 0">'+
+    'bridge signals: <b>'+totalSignalsReceived+'</b> &nbsp; last: '+lastSignalType+'<br>'+
+    'landed elsewhere: <b>'+ackApplied+'</b><br>'+
+    'mean bridge influence: <span class="bridge">'+(meanInfluence*100).toFixed(1)+'%</span> <span style="opacity:0.6">(decaying)</span><br>'+
+    'seeded <span class="bridge">'+bridgeSeeded+'</span> &nbsp; bridge wins <span class="bridge">'+bridgeReproductions+'</span><br>'+
+    '<hr style="border:0;border-top:1px solid #223;margin:4px 0">'+
+    (best ? ('best rule <b>'+best.rule+'</b>  score '+ (best.score||0).toFixed(3) +'  dens '+(best.finalDens||0).toFixed(2)) : '—');
+}
+
+// Boot
+resize();
+try{
+  if(!loadFromLocalStorage()) seedPopulation();
+}catch(e){
+  hud.textContent='seed error: '+e.message;
+  seedPopulation();
+}
+setInterval(saveToLocalStorage, 12000);
+
+function loop(){
+  try{
+    tick++;
+    drainBridgeQueue();
+    if(tick % GROWTH_CYCLE === 0) growthCycle();
+    if(tick % 200 === 0){
+      const b=population.reduce((a,ind)=>(ind.score||0)>(a?a.score:-1)?ind:a, null);
+      if(b) speakStructure(b);
+    }
+    draw();
+  }catch(e){
+    hud.textContent='runtime: '+e.message;
+    console.error(e);
+  }
+  requestAnimationFrame(loop);
+}
+loop();
+})();
+</script>
+</body>
 </html>
